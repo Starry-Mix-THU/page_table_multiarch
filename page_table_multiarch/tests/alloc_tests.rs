@@ -38,9 +38,7 @@ impl<M: PagingMetaData> PagingHandler for TrackPagingHandler<M> {
     }
 
     fn phys_to_virt(paddr: PhysAddr) -> VirtAddr {
-        if paddr.as_usize() == 0 {
-            panic!();
-        }
+        assert_ne!(paddr.as_usize(), 0);
         VirtAddr::from_usize(paddr.as_usize())
     }
 }
