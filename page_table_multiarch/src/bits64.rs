@@ -549,6 +549,72 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Mut<'a
         }
         self.flush = ToFlush::None;
     }
+
+    /// Replace a range that is currently backed by 4K pages with a single
+    /// huge-page mapping (2M or 1G), and free the intermediate page-table
+    /// levels that are no longer needed.
+    ///
+    /// - `size == PageSize::Size2M`: update the P2 entry and free the P1 table.
+    /// - `size == PageSize::Size1G`: update the P3 entry and free the P2/P1
+    ///   subtree.
+    ///
+    /// The caller must ensure:
+    /// - `vaddr` and `pa` are aligned to `size`;
+    /// - the existing mapping under `vaddr` is fully covered by small pages
+    ///   corresponding to `size` (e.g., 512 x 4K for 2M).
+    pub fn remap_huge(
+        &mut self,
+        vaddr: M::VirtAddr,
+        pa: PhysAddr,
+        flags: MappingFlags,
+        size: PageSize,
+    ) -> PagingResult {
+        let vaddr: usize = vaddr.into();
+        match size {
+            PageSize::Size1G => {
+                let p3 = if M::LEVELS == 3 {
+                    self.table_of_mut(self.root_paddr())
+                } else if M::LEVELS == 4 {
+                    let p4 = self.table_of(self.root_paddr());
+                    let p4e = &p4[p4_index(vaddr)];
+                    self.next_table_mut(p4e)?
+                } else {
+                    unreachable!()
+                };
+                let p3e = &mut p3[p3_index(vaddr)];
+
+                let p2table_paddr = p3e.paddr();
+                *p3e = GenericPTE::new_page(pa, flags, true);
+                self.dealloc_tree(p2table_paddr, M::LEVELS - 2);
+            }
+            PageSize::Size2M => {
+                let p3 = if M::LEVELS == 3 {
+                    self.table_of(self.root_paddr())
+                } else if M::LEVELS == 4 {
+                    let p4 = self.table_of(self.root_paddr());
+                    let p4e = &p4[p4_index(vaddr)];
+                    self.next_table(p4e)?
+                } else {
+                    unreachable!()
+                };
+                let p3e = &p3[p3_index(vaddr)];
+                let p2 = self.next_table_mut(p3e)?;
+                let p2e = &mut p2[p2_index(vaddr)];
+
+                let p1table_paddr = p2e.paddr();
+                *p2e = GenericPTE::new_page(pa, flags, true);
+                self.dealloc_tree(p1table_paddr, M::LEVELS - 1);
+            }
+            _ => {
+                error!("remap_huge called with non-huge page size: {:?}", size);
+                return Err(PagingError::NotAligned);
+            }
+        }
+        // We changed a whole huge-page range, so conservatively flush the full
+        // TLB on commit.
+        self.flush = ToFlush::Full;
+        Ok(())
+    }
 }
 
 impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> Drop for PageTable64Mut<'_, M, PTE, H> {
